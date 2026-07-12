@@ -1,0 +1,163 @@
+{
+  "name": "Email Triage & Draft Assistant",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Cron - Every Morning 7h",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Déclenchement quotidien à 7h. Peut aussi être remplacé par un trigger Gmail 'nouveau email reçu' pour un traitement en temps réel plutôt que par batch matinal."
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "resource": "message",
+        "returnAll": false,
+        "limit": 50,
+        "filters": {
+          "q": "is:unread newer_than:1d"
+        }
+      },
+      "id": "gmail-fetch",
+      "name": "Gmail - Fetch Unread",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "notes": "Récupère les emails non lus des dernières 24h. Ajuster le filtre Gmail selon volume réel du client."
+    },
+    {
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": "claude-sonnet-4-6",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Tu es un assistant de triage email. Pour chaque email, classe-le dans une des 3 catégories : URGENT (action requise sous 24h, client important, deadline, problème), A_TRAITER (nécessite une réponse mais pas urgent), ARCHIVER (newsletter, spam, notification automatique, pas d'action requise). Réponds uniquement en JSON: {\"categorie\": \"...\", \"raison\": \"...\", \"draft_reponse\": \"...\" (uniquement si URGENT, sinon null)}"
+            },
+            {
+              "role": "user",
+              "content": "=Expéditeur: {{$json.from}}\\nObjet: {{$json.subject}}\\nContenu: {{$json.snippet}}"
+            }
+          ]
+        }
+      },
+      "id": "claude-classify",
+      "name": "Claude - Classify Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [680, 300],
+      "notes": "Appel à l'API Claude pour classification + génération de draft pour les emails urgents. Remplacer modelId selon disponibilité API au moment du déploiement. Ajouter la clé API Anthropic dans les credentials n8n."
+    },
+    {
+      "parameters": {
+        "functionCode": "// Parse la réponse Claude et fusionne avec les données email originales\nconst claudeResponse = JSON.parse($input.item.json.content[0].text);\nconst emailData = $input.item.json;\n\nreturn {\n  json: {\n    from: emailData.from,\n    subject: emailData.subject,\n    snippet: emailData.snippet,\n    messageId: emailData.id,\n    categorie: claudeResponse.categorie,\n    raison: claudeResponse.raison,\n    draft_reponse: claudeResponse.draft_reponse\n  }\n};"
+      },
+      "id": "parse-classification",
+      "name": "Parse Classification",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 300],
+      "notes": "Structure la sortie Claude pour le routing suivant. Vérifier que le parsing JSON gère les cas d'échec (voir Continue On Fail)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.categorie}}",
+              "value2": "URGENT"
+            }
+          ]
+        }
+      },
+      "id": "if-urgent",
+      "name": "IF Urgent",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1120, 200],
+      "notes": "Route les emails urgents vers création de draft Gmail + notification. Les autres continuent vers le résumé récapitulatif."
+    },
+    {
+      "parameters": {
+        "resource": "draft",
+        "operation": "create",
+        "message": "={{$json.draft_reponse}}",
+        "threadId": "={{$json.messageId}}"
+      },
+      "id": "gmail-create-draft",
+      "name": "Gmail - Create Draft",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [1340, 120],
+      "notes": "Crée un brouillon de réponse dans Gmail pour validation manuelle. Le client valide et envoie lui-même — jamais d'envoi automatique sans validation humaine."
+    },
+    {
+      "parameters": {
+        "functionCode": "// Agrège tous les emails classés en un résumé unique pour notification\nconst items = $input.all();\nconst urgent = items.filter(i => i.json.categorie === 'URGENT');\nconst aTraiter = items.filter(i => i.json.categorie === 'A_TRAITER');\nconst archiver = items.filter(i => i.json.categorie === 'ARCHIVER');\n\nconst summary = `📬 BRIEF EMAIL DU MATIN\\n\\n🔴 URGENT (${urgent.length}): ${urgent.map(i => i.json.subject).join(', ') || 'aucun'}\\n\\n🟡 À TRAITER (${aTraiter.length}): ${aTraiter.map(i => i.json.subject).join(', ') || 'aucun'}\\n\\n⚪ ARCHIVÉ (${archiver.length}) — pas d'action requise`;\n\nreturn { json: { summary } };"
+      },
+      "id": "aggregate-summary",
+      "name": "Aggregate Daily Summary",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 400],
+      "notes": "Construit le résumé quotidien envoyé au client. Format lisible en 30 secondes au réveil."
+    },
+    {
+      "parameters": {
+        "channel": "#brief-quotidien",
+        "text": "={{$json.summary}}"
+      },
+      "id": "slack-summary",
+      "name": "Slack - Send Daily Brief",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1560, 400],
+      "notes": "Envoie le brief quotidien sur Slack (ou remplacer par notification email/WhatsApp selon préférence client)."
+    }
+  ],
+  "connections": {
+    "Cron - Every Morning 7h": {
+      "main": [[{ "node": "Gmail - Fetch Unread", "type": "main", "index": 0 }]]
+    },
+    "Gmail - Fetch Unread": {
+      "main": [[{ "node": "Claude - Classify Email", "type": "main", "index": 0 }]]
+    },
+    "Claude - Classify Email": {
+      "main": [[{ "node": "Parse Classification", "type": "main", "index": 0 }]]
+    },
+    "Parse Classification": {
+      "main": [[{ "node": "IF Urgent", "type": "main", "index": 0 }]]
+    },
+    "IF Urgent": {
+      "main": [
+        [{ "node": "Gmail - Create Draft", "type": "main", "index": 0 }],
+        [{ "node": "Aggregate Daily Summary", "type": "main", "index": 0 }]
+      ]
+    },
+    "Gmail - Create Draft": {
+      "main": [[{ "node": "Aggregate Daily Summary", "type": "main", "index": 0 }]]
+    },
+    "Aggregate Daily Summary": {
+      "main": [[{ "node": "Slack - Send Daily Brief", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "description": "Workflow de triage email quotidien avec génération de drafts pour les emails urgents. Brique Tier 2 réutilisable. Nécessite: Gmail API OAuth, Anthropic API key, Slack API configurés dans n8n avant import. Validation humaine systématique avant tout envoi."
+  }
+}
